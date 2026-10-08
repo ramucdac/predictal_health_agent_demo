@@ -155,6 +155,174 @@ def calculate_health_score(df: pd.DataFrame):
     return score, status, problems
 
 
+def get_sample_servicenow_incidents(environment: str) -> pd.DataFrame:
+    now = datetime.now()
+    incidents = [
+        {
+            "number": "INC1002401",
+            "environment": "PREDICTAL-PROD",
+            "priority": "1 - Critical",
+            "state": "In Progress",
+            "symptoms": ["response_time", "http_504", "connector_timeout", "peak_traffic"],
+            "short_description": "Slow transactions and intermittent 504 responses",
+            "description": (
+                "Users report slow case loads and intermittent gateway timeouts. "
+                "The issue began during peak traffic."
+            ),
+            "assignment_group": "Pega Platform Support",
+            "opened_at": now - timedelta(hours=1, minutes=18),
+        },
+        {
+            "number": "INC1002402",
+            "environment": "PREDICTAL-PROD",
+            "priority": "2 - High",
+            "state": "New",
+            "symptoms": ["connector_timeout", "downstream_api", "http_504"],
+            "short_description": "Connector requests timing out to customer API",
+            "description": (
+                "A customer API connector has intermittent timeouts. "
+                "The downstream service has not yet been confirmed as the cause."
+            ),
+            "assignment_group": "Integration Operations",
+            "opened_at": now - timedelta(minutes=42),
+        },
+        {
+            "number": "INC1002403",
+            "environment": "PREDICTAL-QA",
+            "priority": "3 - Moderate",
+            "state": "Assigned",
+            "symptoms": ["response_time", "load_test"],
+            "short_description": "Elevated response time during regression tests",
+            "description": (
+                "Response time increased while the regression suite was running. "
+                "No customer impact reported."
+            ),
+            "assignment_group": "Quality Engineering",
+            "opened_at": now - timedelta(hours=2, minutes=5),
+        },
+        {
+            "number": "INC1002404",
+            "environment": "PREDICTAL-DEV",
+            "priority": "4 - Low",
+            "state": "Resolved",
+            "symptoms": ["heap", "test_data"],
+            "short_description": "High heap utilization after test data load",
+            "description": (
+                "Heap utilization increased during a development data load and "
+                "returned to normal after the test completed."
+            ),
+            "assignment_group": "Development Platform",
+            "opened_at": now - timedelta(hours=5),
+        },
+    ]
+
+    return pd.DataFrame(
+        incident
+        for incident in incidents
+        if incident["environment"] == environment
+    )
+
+
+def find_similar_servicenow_incidents(
+    incident: dict,
+    limit: int = 3,
+) -> pd.DataFrame:
+    now = datetime.now()
+    history = [
+        {
+            "number": "INC0998420",
+            "environment": "PREDICTAL-PROD",
+            "priority": "1 - Critical",
+            "short_description": "Case loads slow with repeated gateway timeouts",
+            "symptoms": ["response_time", "http_504", "connector_timeout"],
+            "root_cause": "Customer profile API latency caused connector retries to queue.",
+            "resolution": (
+                "Coordinated with the API owner to restore service, then verified "
+                "connector latency and 504 rates returned to baseline."
+            ),
+            "resolved_at": now - timedelta(days=18),
+        },
+        {
+            "number": "INC0997314",
+            "environment": "PREDICTAL-PROD",
+            "priority": "2 - High",
+            "short_description": "Connector calls to customer API exceeded timeout",
+            "symptoms": ["connector_timeout", "downstream_api"],
+            "root_cause": "Intermittent latency in the downstream customer API.",
+            "resolution": (
+                "Confirmed recovery with the API owner and replayed failed requests "
+                "after validating that duplicate processing was prevented."
+            ),
+            "resolved_at": now - timedelta(days=31),
+        },
+        {
+            "number": "INC0996208",
+            "environment": "PREDICTAL-PROD",
+            "priority": "2 - High",
+            "short_description": "Elevated case response time during peak volume",
+            "symptoms": ["response_time", "peak_traffic"],
+            "root_cause": "Requestor queue growth coincided with peak transaction volume.",
+            "resolution": (
+                "Reduced the queued workload and confirmed response time recovered; "
+                "capacity tuning was tracked as a follow-up."
+            ),
+            "resolved_at": now - timedelta(days=46),
+        },
+        {
+            "number": "INC0995092",
+            "environment": "PREDICTAL-QA",
+            "priority": "3 - Moderate",
+            "short_description": "Slow response during regression test execution",
+            "symptoms": ["response_time", "load_test"],
+            "root_cause": "Concurrent regression jobs saturated the QA test nodes.",
+            "resolution": (
+                "Staggered the regression jobs and confirmed response time returned "
+                "to the normal test baseline."
+            ),
+            "resolved_at": now - timedelta(days=12),
+        },
+        {
+            "number": "INC0994187",
+            "environment": "PREDICTAL-DEV",
+            "priority": "4 - Low",
+            "short_description": "Heap utilization increased after importing test data",
+            "symptoms": ["heap", "test_data"],
+            "root_cause": "A large development data import temporarily increased heap use.",
+            "resolution": (
+                "Completed the import in smaller batches and verified heap returned "
+                "to its normal range after processing."
+            ),
+            "resolved_at": now - timedelta(days=8),
+        },
+    ]
+
+    current_symptoms = set(incident.get("symptoms", []))
+    matches = []
+
+    for past_incident in history:
+        past_symptoms = set(past_incident["symptoms"])
+        shared_symptoms = current_symptoms & past_symptoms
+        all_symptoms = current_symptoms | past_symptoms
+        if not shared_symptoms or not all_symptoms:
+            continue
+
+        match = past_incident.copy()
+        match["similarity_percent"] = round(
+            100 * len(shared_symptoms) / len(all_symptoms)
+        )
+        match["matched_symptoms"] = sorted(shared_symptoms)
+        match["same_environment"] = (
+            past_incident["environment"] == incident.get("environment")
+        )
+        matches.append(match)
+
+    matches.sort(
+        key=lambda match: (match["similarity_percent"], match["same_environment"]),
+        reverse=True,
+    )
+    return pd.DataFrame(matches[:limit])
+
+
 # -----------------------------
 # LangChain tools
 # -----------------------------
@@ -260,8 +428,55 @@ RISK
 """
 
 
-def run_ai_analysis(environment: str, metrics: dict) -> str:
+def run_ai_analysis(
+    environment: str,
+    metrics: dict,
+    incident: dict | None = None,
+    similar_incidents: list[dict] | None = None,
+) -> str:
     if not os.getenv("OPENAI_API_KEY"):
+        if incident and metrics["http_504"] > 20 and metrics["connector_timeouts"] > 20:
+            correlation = (
+                "The reported timeout symptoms align with elevated HTTP 504s and "
+                "connector timeouts. Confirm downstream API health and connector logs."
+            )
+        elif (
+            incident
+            and metrics["response_time_ms"] > 2000
+            and metrics["requestors_per_node"] > 350
+        ):
+            correlation = (
+                "The reported latency may align with elevated response time and "
+                "requestor load. Check node capacity and requestor queues."
+            )
+        else:
+            correlation = (
+                "The current metrics do not confirm the incident cause. Compare "
+                "the affected time window with PDC and application logs."
+            )
+
+        incident_summary = ""
+        if incident:
+            incident_summary = (
+                f"\n\nServiceNow sample: {incident['number']} "
+                f"({incident['priority']}, {incident['state']})\n"
+                f"Reported issue: {incident['short_description']}\n"
+                f"Description: {incident['description']}\n"
+                f"Initial correlation: {correlation}"
+            )
+
+        historical_summary = ""
+        if similar_incidents:
+            historical_summary = "\n\nSimilar resolved sample incidents and fixes:"
+            for past_incident in similar_incidents:
+                historical_summary += (
+                    f"\n- {past_incident['number']} "
+                    f"({past_incident['similarity_percent']}% match): "
+                    f"{past_incident['short_description']} "
+                    f"Root cause: {past_incident['root_cause']} "
+                    f"Resolution: {past_incident['resolution']}"
+                )
+
         return (
             "AI analysis is disabled because OPENAI_API_KEY is not configured.\n\n"
             "Demo rule-based assessment:\n"
@@ -270,6 +485,8 @@ def run_ai_analysis(environment: str, metrics: dict) -> str:
             f"- Heap: {metrics['heap_percent']}%\n"
             f"- HTTP 504: {metrics['http_504']}\n"
             f"- Connector timeouts: {metrics['connector_timeouts']}\n"
+            f"{incident_summary}"
+            f"{historical_summary}"
         )
 
     llm = ChatOpenAI(
@@ -288,7 +505,18 @@ Analyze {environment} using these current PDC metrics:
 
 {metrics}
 
-Provide the health assessment and recommended actions.
+Selected ServiceNow sample incident:
+{incident or "No incident selected"}
+
+Similar resolved sample incidents and recorded resolutions:
+{similar_incidents or "No matching history found"}
+
+Correlate the reported incident symptoms with the supplied telemetry. Treat the
+incident description as user-reported information, not a confirmed root cause.
+Treat historical sample resolutions as prior examples, not proof of the current
+root cause or a guaranteed fix.
+Provide the health assessment, evidence, next diagnostic steps, and recommended
+actions.
 """
 
     result = agent.invoke({
@@ -450,15 +678,80 @@ if latest.heap_percent > 80:
 if events:
     st.dataframe(
         pd.DataFrame(events),
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 else:
     st.info("No significant PDC events detected.")
 
+# ServiceNow incident samples
+st.divider()
+st.subheader("🎫 ServiceNow Incident Samples")
+st.caption("Sample records for demonstration; no live ServiceNow instance is queried.")
+
+incidents = get_sample_servicenow_incidents(environment)
+incident_columns = [
+    "number",
+    "priority",
+    "state",
+    "short_description",
+    "assignment_group",
+    "opened_at",
+]
+st.dataframe(
+    incidents[incident_columns],
+    width="stretch",
+    hide_index=True,
+)
+
+incident_descriptions = incidents.set_index("number")["short_description"].to_dict()
+selected_incident_number = st.selectbox(
+    "Incident to include in analysis",
+    incidents["number"].tolist(),
+    format_func=lambda number: (
+        f"{number} | {incident_descriptions[number]}"
+    ),
+)
+selected_incident = incidents.loc[
+    incidents["number"] == selected_incident_number
+].iloc[0].to_dict()
+
+st.subheader("🧩 Similar Resolved Incidents and Fixes")
+st.caption(
+    "Ranked by shared symptoms. Historical incidents and resolutions below are "
+    "illustrative demo data, not live ServiceNow records."
+)
+similar_incidents = find_similar_servicenow_incidents(selected_incident)
+
+if similar_incidents.empty:
+    st.info("No similar historical incidents found for this sample.")
+else:
+    match_columns = [
+        "number",
+        "similarity_percent",
+        "environment",
+        "short_description",
+        "matched_symptoms",
+        "resolved_at",
+    ]
+    st.dataframe(
+        similar_incidents[match_columns],
+        width="stretch",
+        hide_index=True,
+    )
+
+    for past_incident in similar_incidents.to_dict(orient="records"):
+        with st.expander(
+            f"{past_incident['number']} · "
+            f"{past_incident['similarity_percent']}% symptom match · "
+            f"{past_incident['short_description']}"
+        ):
+            st.write(f"**Probable root cause:** {past_incident['root_cause']}")
+            st.write(f"**Recorded resolution (demo):** {past_incident['resolution']}")
+
 # AI
 st.divider()
-st.subheader("🤖 LangChain AI Analysis")
+st.subheader("🤖 LangChain Incident Analysis")
 
 metrics = {
     "environment": environment,
@@ -472,9 +765,14 @@ metrics = {
     "pdc_alerts": int(latest.pdc_alerts),
 }
 
-if st.button("🧠 Analyze with LangChain", type="primary"):
-    with st.spinner("LangChain is analyzing Predictal telemetry..."):
-        analysis = run_ai_analysis(environment, metrics)
+if st.button("🧠 Analyze telemetry + incident", type="primary"):
+    with st.spinner("LangChain is correlating telemetry and the incident..."):
+        analysis = run_ai_analysis(
+            environment,
+            metrics,
+            selected_incident,
+            similar_incidents.to_dict(orient="records"),
+        )
     st.markdown(analysis)
 
 st.divider()
