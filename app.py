@@ -1,6 +1,9 @@
 import os
 import random
+import smtplib
+import ssl
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 
 import pandas as pd
 import streamlit as st
@@ -24,6 +27,7 @@ st.set_page_config(
 def get_pdc_telemetry(environment: str, minutes: int = 60) -> pd.DataFrame:
     now = datetime.now()
     rows = []
+    rng = random.Random(f"demo:{environment}")
 
     # Different baseline by environment
     base = {
@@ -40,25 +44,25 @@ def get_pdc_telemetry(environment: str, minutes: int = 60) -> pd.DataFrame:
 
         response = (
             900
-            + random.randint(-120, 180)
+            + rng.randint(-120, 180)
             + int(2500 * degradation * base)
         )
 
         requestors = (
             230
-            + random.randint(-25, 35)
+            + rng.randint(-25, 35)
             + int(180 * degradation * base)
         )
 
         heap = (
             58
-            + random.randint(-4, 5)
+            + rng.randint(-4, 5)
             + int(25 * degradation * base)
         )
 
         cpu = (
             48
-            + random.randint(-8, 8)
+            + rng.randint(-8, 8)
             + int(32 * degradation * base)
         )
 
@@ -66,7 +70,7 @@ def get_pdc_telemetry(environment: str, minutes: int = 60) -> pd.DataFrame:
             0.1,
             round(
                 0.4
-                + random.uniform(0, 0.7)
+                + rng.uniform(0, 0.7)
                 + 3.8 * degradation * base,
                 2
             )
@@ -74,12 +78,12 @@ def get_pdc_telemetry(environment: str, minutes: int = 60) -> pd.DataFrame:
 
         timeout = max(
             0,
-            int(random.uniform(0, 3) + 30 * degradation * base)
+            int(rng.uniform(0, 3) + 30 * degradation * base)
         )
 
         errors_504 = max(
             0,
-            int(random.uniform(0, 3) + 35 * degradation * base)
+            int(rng.uniform(0, 3) + 35 * degradation * base)
         )
 
         alerts = 0
@@ -321,6 +325,148 @@ def find_similar_servicenow_incidents(
         reverse=True,
     )
     return pd.DataFrame(matches[:limit])
+
+
+def make_alert_deduplication_key(
+    environment: str,
+    event_number: str,
+    timestamp: datetime,
+) -> str:
+    environment_code = environment.rsplit("-", 1)[-1]
+    return f"{environment_code}-{timestamp:%Y%m%d%H%M}-{event_number}"
+
+
+def is_email_alerts_enabled() -> bool:
+    value = os.getenv("ENABLE_EMAIL_ALERTS", "false").strip().lower()
+    if value not in {"true", "false", "1", "0", "yes", "no"}:
+        raise ValueError("ENABLE_EMAIL_ALERTS must be true or false.")
+    return value in {"true", "1", "yes"}
+
+
+def find_matching_prior_incidents(
+    environment: str,
+    symptoms: list[str],
+    observed_at: datetime,
+) -> list[dict]:
+    matches = find_similar_servicenow_incidents({
+        "environment": environment,
+        "symptoms": symptoms,
+    })
+    return [
+        incident
+        for incident in matches.to_dict(orient="records")
+        if incident["environment"] == environment
+        and incident["resolved_at"] < observed_at
+    ]
+
+
+def build_team_email_message(
+    environment: str,
+    metrics: dict,
+    pdc_event: dict,
+    prior_incidents: list[dict],
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = (
+        f"[Predictal][{environment}][{pdc_event['Severity']}] "
+        f"{pdc_event['PDC Event Number']}"
+    )
+    sender = os.getenv("ALERT_FROM_EMAIL")
+    recipients = [
+        address.strip()
+        for address in os.getenv("ALERT_TO_EMAILS", "").split(",")
+        if address.strip()
+    ]
+    if sender:
+        message["From"] = sender
+    if recipients:
+        message["To"] = ", ".join(recipients)
+    history_text = "\n".join(
+        f"- {incident['number']}: {incident['short_description']} "
+        f"(resolved {incident['resolved_at']})"
+        for incident in prior_incidents
+    )
+    message.set_content(
+        "Predictal detected a PDC event matching earlier ServiceNow incident "
+        "symptoms.\n\n"
+        f"Environment: {environment}\n"
+        f"PDC Event Number: {pdc_event['PDC Event Number']}\n"
+        f"Event: {pdc_event['Event']}\n"
+        f"Severity: {pdc_event['Severity']}\n"
+        f"Browser response time: {metrics['response_time_ms']} ms\n"
+        f"HTTP 504 errors: {metrics['http_504']}\n"
+        f"Connector timeouts: {metrics['connector_timeouts']}\n"
+        f"Requestors per node: {metrics['requestors_per_node']}\n"
+        f"JVM heap: {metrics['heap_percent']}%\n"
+        "Earlier same-environment ServiceNow incidents with similar symptoms:\n"
+        f"{history_text}\n\n"
+        "This is a suspected correlation, not a confirmed root cause."
+    )
+    return message
+
+
+def send_team_email_alert(
+    environment: str,
+    metrics: dict,
+    pdc_event: dict,
+    prior_incidents: list[dict],
+) -> list[str]:
+    required_settings = {
+        "SMTP_HOST": os.getenv("SMTP_HOST"),
+        "ALERT_FROM_EMAIL": os.getenv("ALERT_FROM_EMAIL"),
+        "ALERT_TO_EMAILS": os.getenv("ALERT_TO_EMAILS"),
+    }
+    missing_settings = [
+        name for name, value in required_settings.items() if not value
+    ]
+    if missing_settings:
+        raise ValueError(
+            "Email alert is not configured. Set: "
+            + ", ".join(missing_settings)
+        )
+
+    host = required_settings["SMTP_HOST"]
+    recipients = [
+        address.strip()
+        for address in required_settings["ALERT_TO_EMAILS"].split(",")
+        if address.strip()
+    ]
+    if not recipients:
+        raise ValueError("ALERT_TO_EMAILS must contain at least one address.")
+
+    port = int(os.getenv("SMTP_PORT", "587"))
+    if not 1 <= port <= 65535:
+        raise ValueError("SMTP_PORT must be between 1 and 65535.")
+
+    use_tls_value = os.getenv("SMTP_USE_TLS", "true").strip().lower()
+    if use_tls_value not in {"true", "false", "1", "0", "yes", "no"}:
+        raise ValueError("SMTP_USE_TLS must be true or false.")
+    use_tls = use_tls_value in {"true", "1", "yes"}
+
+    username = os.getenv("SMTP_USERNAME")
+    password = os.getenv("SMTP_PASSWORD")
+    if bool(username) != bool(password):
+        raise ValueError(
+            "Set both SMTP_USERNAME and SMTP_PASSWORD, or leave both empty."
+        )
+
+    message = build_team_email_message(
+        environment,
+        metrics,
+        pdc_event,
+        prior_incidents,
+    )
+
+    with smtplib.SMTP(host, port, timeout=15) as smtp:
+        smtp.ehlo()
+        if use_tls:
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+        if username and password:
+            smtp.login(username, password)
+        smtp.send_message(message)
+
+    return recipients
 
 
 # -----------------------------
@@ -640,11 +786,26 @@ with right:
 
 # PDC alerts
 st.subheader("🚨 PDC Event Summary")
+email_alerts_enabled = is_email_alerts_enabled()
 
 events = []
 
+if latest.response_time_ms > 2000:
+    events.append({
+        "event_number": "PEGA0001",
+        "symptoms": ["response_time"],
+        "Time": latest.timestamp.strftime("%H:%M"),
+        "Event": "High browser response time",
+        "Source": "Pega Web Node",
+        "Severity": (
+            "CRITICAL" if latest.response_time_ms > 5000 else "HIGH"
+        ),
+    })
+
 if latest.http_504 > 20:
     events.append({
+        "event_number": "PEGA0002",
+        "symptoms": ["http_504"],
         "Time": latest.timestamp.strftime("%H:%M"),
         "Event": "HTTP 504 spike",
         "Source": "External API / Connector",
@@ -653,14 +814,18 @@ if latest.http_504 > 20:
 
 if latest.connector_timeouts > 20:
     events.append({
+        "event_number": "PEGA00020",
+        "symptoms": ["connector_timeout"],
         "Time": latest.timestamp.strftime("%H:%M"),
-        "Event": "Connector timeout",
+        "Event": "Connector total time / timeout",
         "Source": "Pega Connector",
         "Severity": "HIGH"
     })
 
 if latest.requestors_per_node > 350:
     events.append({
+        "event_number": "PEGA0003",
+        "symptoms": ["peak_traffic"],
         "Time": latest.timestamp.strftime("%H:%M"),
         "Event": "High requestors",
         "Source": "Pega Web Node",
@@ -669,6 +834,8 @@ if latest.requestors_per_node > 350:
 
 if latest.heap_percent > 80:
     events.append({
+        "event_number": "PEGA0004",
+        "symptoms": ["heap"],
         "Time": latest.timestamp.strftime("%H:%M"),
         "Event": "High JVM heap",
         "Source": "Pega JVM",
@@ -676,11 +843,100 @@ if latest.heap_percent > 80:
     })
 
 if events:
+    email_previews = []
+    for event in events:
+        event["PDC Event Number"] = event.pop("event_number")
+        matching_incidents = find_matching_prior_incidents(
+            environment,
+            event["symptoms"],
+            latest.timestamp,
+        )
+        event["Related ServiceNow Case(s)"] = (
+            ", ".join(incident["number"] for incident in matching_incidents)
+            or "None"
+        )
+
+        if (
+            event["Severity"] in {"CRITICAL", "HIGH"}
+            and matching_incidents
+        ):
+            email_message = build_team_email_message(
+                environment,
+                {
+                    "response_time_ms": int(latest.response_time_ms),
+                    "http_504": int(latest.http_504),
+                    "connector_timeouts": int(latest.connector_timeouts),
+                    "requestors_per_node": int(latest.requestors_per_node),
+                    "heap_percent": int(latest.heap_percent),
+                },
+                event,
+                matching_incidents,
+            )
+            email_previews.append((event, email_message))
+
+            attempted_alerts = st.session_state.setdefault(
+                "attempted_pdc_email_alerts", set()
+            )
+            deduplication_key = make_alert_deduplication_key(
+                environment,
+                event["PDC Event Number"],
+                latest.timestamp,
+            )
+            if (
+                email_alerts_enabled
+                and deduplication_key not in attempted_alerts
+            ):
+                attempted_alerts.add(deduplication_key)
+                try:
+                    notified_recipients = send_team_email_alert(
+                        environment,
+                        {
+                            "response_time_ms": int(latest.response_time_ms),
+                            "http_504": int(latest.http_504),
+                            "connector_timeouts": int(latest.connector_timeouts),
+                            "requestors_per_node": int(latest.requestors_per_node),
+                            "heap_percent": int(latest.heap_percent),
+                        },
+                        event,
+                        matching_incidents,
+                    )
+                except (OSError, smtplib.SMTPException, ValueError) as error:
+                    st.error(
+                        "Could not send alert "
+                        f"{event['PDC Event Number']}: {error}"
+                    )
+                else:
+                    st.success(
+                        f"Event {event['PDC Event Number']} emailed to "
+                        + ", ".join(notified_recipients)
+                    )
+
     st.dataframe(
-        pd.DataFrame(events),
+        pd.DataFrame(events).drop(columns=["symptoms"]),
         width="stretch",
         hide_index=True
     )
+    if email_previews:
+        with st.expander("✉️ Email notification preview", expanded=True):
+            st.caption(
+                "Preview of the email sent for matching Critical/High events."
+            )
+            if email_alerts_enabled:
+                st.info("Email delivery is enabled; matching alerts are sent automatically.")
+            else:
+                st.info(
+                    "Demo mode: this is a preview only. No email will be sent. "
+                    "Set ENABLE_EMAIL_ALERTS=true to enable SMTP delivery."
+                )
+            for event, message in email_previews:
+                st.markdown(
+                    f"**{event['PDC Event Number']} — {event['Event']} "
+                    f"({event['Severity']})**"
+                )
+                st.text(f"From: {message.get('From', 'Not configured')}")
+                st.text(f"To: {message.get('To', 'Not configured')}")
+                st.text(f"Subject: {message['Subject']}")
+                st.code(message.get_content(), language="text")
 else:
     st.info("No significant PDC events detected.")
 
